@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""
+iwd-helper: JSON bridge between iwd and Noctalia Shell NetworkService.
+Drop-in replacement for nmcli-based network queries.
+
+Install:
+    sudo install -m755 iwd-helper /usr/local/bin/iwd-helper
+
+Requires: iwd, busctl (systemd), ip (iproute2), iw, curl
+Optional: resolvectl (systemd-resolved)
+"""
+
+import subprocess
+import json
+import sys
+import os
+import re
+import time
+
+IWD = "net.connman.iwd"
+TIMEOUT = 10
+
+# ─── Subprocess helpers ───────────────────────────────────────────────
+
+def run(cmd, timeout=TIMEOUT):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip(), r.stderr.strip(), r.returncode
+    except subprocess.TimeoutExpired:
+        return "", "timeout", 1
+    except FileNotFoundError:
+        return "", f"not found: {cmd[0]}", 127
+
+def busctl_get(path, iface, prop):
+    """Read a single D-Bus property. Returns parsed Python value."""
+    out, _, rc = run(["busctl", "get-property", IWD, path, iface, prop])
+    if rc != 0 or not out:
+        return None
+    m = re.match(r'^(\w+)\s+(.+)$', out)
+    if not m:
+        return None
+    t, v = m.group(1), m.group(2)
+    if t in ('s', 'o'):
+        return v.strip('"')
+    if t == 'b':
+        return v == 'true'
+    if t in ('n', 'i', 'u', 'x', 't', 'q', 'y'):
+        try:
+            return int(v)
+        except ValueError:
+            return None
+    return v
+
+# ─── Discovery ────────────────────────────────────────────────────────
+
+_paths_cache = None
+
+def discover():
+    """Find iwd adapter/device/station paths. Cached per invocation."""
+    global _paths_cache
+    if _paths_cache is not None:
+        return _paths_cache
+
+    result = {"adapter": None, "device": None, "station": None, "known": []}
+
+    # Try GetManagedObjects first (single D-Bus call)
+    out, _, rc = run(["busctl", "--json=short", "call", IWD, "/",
+                      "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"])
+    if rc == 0 and out:
+        try:
+            blob = json.loads(out)
+            objects = blob.get("data", blob)
+            if isinstance(objects, list) and len(objects) == 1:
+                objects = objects[0]
+            if isinstance(objects, dict):
+                for path, ifaces in objects.items():
+                    if not isinstance(ifaces, dict):
+                        continue
+                    if "net.connman.iwd.Adapter" in ifaces and not result["adapter"]:
+                        result["adapter"] = path
+                    if "net.connman.iwd.Device" in ifaces and not result["device"]:
+                        result["device"] = path
+                    if "net.connman.iwd.Station" in ifaces and not result["station"]:
+                        result["station"] = path
+                    if "net.connman.iwd.KnownNetwork" in ifaces:
+                        result["known"].append(path)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+    # Fallback: tree + introspect (slower but reliable)
+    if not result["station"]:
+        out, _, rc = run(["busctl", "tree", "--no-pager", "--list", IWD])
+        if rc == 0:
+            for line in out.split("\n"):
+                path = line.strip()
+                if not path.startswith("/net/connman/iwd"):
+                    continue
+                iout, _, irc = run(["busctl", "introspect", "--no-pager", "--list", IWD, path])
+                if irc != 0:
+                    continue
+                if "net.connman.iwd.Adapter" in iout and not result["adapter"]:
+                    result["adapter"] = path
+                if "net.connman.iwd.Device" in iout and not result["device"]:
+                    result["device"] = path
+                if "net.connman.iwd.Station" in iout and not result["station"]:
+                    result["station"] = path
+                if "net.connman.iwd.KnownNetwork" in iout:
+                    result["known"].append(path)
+
+    _paths_cache = result
+    return result
+
+# ─── Helpers ──────────────────────────────────────────────────────────
+
+def dbm100_to_pct(raw):
+    """Convert iwd signal (1/100 dBm) to 0-100 percentage."""
+    dbm = raw / 100.0
+    return max(0, min(100, int(2 * (dbm + 100))))
+
+def iwd_sec(iwd_type):
+    """Map iwd network type to security label."""
+    return {
+        "open": "open", "wep": "wep",
+        "psk": "wpa2-psk", "8021x": "wpa2-eap"
+    }.get(iwd_type, iwd_type or "--")
+
+def ip_details(iface):
+    """Get IP config for a network interface via ip + resolvectl."""
+    d = {
+        "connectionName": "", "ipv4": "", "gateway4": "",
+        "dns4": [], "ipv6": [], "gateway6": [], "dns6": [],
+        "hwAddr": "", "speed": ""
+    }
+    if not iface:
+        return d
+
+    out, _, _ = run(["ip", "-j", "addr", "show", "dev", iface])
+    if out:
+        try:
+            devs = json.loads(out)
+            if devs:
+                dev = devs[0]
+                d["hwAddr"] = dev.get("address", "")
+                for ai in dev.get("addr_info", []):
+                    if ai.get("family") == "inet" and not d["ipv4"]:
+                        d["ipv4"] = ai.get("local", "")
+                    elif ai.get("family") == "inet6":
+                        d["ipv6"].append(ai.get("local", ""))
+        except (json.JSONDecodeError, KeyError, IndexError):
+            pass
+
+    out, _, _ = run(["ip", "-j", "route", "show", "default", "dev", iface])
+    if out:
+        try:
+            for r in json.loads(out):
+                if r.get("gateway"):
+                    d["gateway4"] = r["gateway"]
+                    break
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    out, _, rc = run(["resolvectl", "dns", iface])
+    if rc == 0 and out:
+        m = re.search(r':\s*(.+)', out)
+        if m:
+            for dns in m.group(1).split():
+                dns = dns.strip()
+                if dns:
+                    (d["dns6"] if ":" in dns else d["dns4"]).append(dns)
+
+    return d
+
+def wifi_link_info(iface):
+    """Get wifi link details (rate, band, channel, signal) from iw."""
+    info = {
+        "rate": "", "rateShort": "", "band": "",
+        "channel": "", "width": "", "signal": "0"
+    }
+    out, _, _ = run(["iw", "dev", iface, "link"])
+    if not out:
+        return info
+
+    freq_val = 0
+    for line in out.split("\n"):
+        line = line.strip()
+        if line.startswith("signal:"):
+            m = re.search(r'(-?\d+)', line)
+            if m:
+                dbm = int(m.group(1))
+                info["signal"] = str(max(0, min(100, 2 * (dbm + 100))))
+        elif "tx bitrate:" in line:
+            rate_str = line.split("tx bitrate:")[1].strip()
+            info["rate"] = rate_str
+            m = re.match(r'([\d.]+)\s*(\S+)', rate_str)
+            if m:
+                info["rateShort"] = f"{float(m.group(1)):.0f} {m.group(2)}"
+        elif line.startswith("freq:"):
+            m = re.search(r'(\d+)', line)
+            if m:
+                freq_val = int(m.group(1))
+
+    if freq_val:
+        if 5925 <= freq_val < 7125:
+            info["band"] = "6 GHz"
+        elif 5150 <= freq_val < 5925:
+            info["band"] = "5 GHz"
+        elif 2400 <= freq_val < 2500:
+            info["band"] = "2.4 GHz"
+        else:
+            info["band"] = f"{freq_val} MHz"
+
+    # Channel + width from iw dev info
+    out2, _, _ = run(["iw", "dev", iface, "info"])
+    if out2:
+        for line in out2.split("\n"):
+            if "channel" in line.lower():
+                m = re.search(r'channel\s+(\d+)', line)
+                if m:
+                    info["channel"] = m.group(1)
+                m2 = re.search(r'width:\s*(\d+)', line)
+                if m2:
+                    info["width"] = f"{m2.group(1)} MHz"
+                break
+
+    return info
+
+def _check_ethernet(out):
+    """Add ethernet info to status dict."""
+    ip_out, _, _ = run(["ip", "-j", "link", "show"])
+    if not ip_out:
+        return
+    try:
+        for link in json.loads(ip_out):
+            name = link.get("ifname", "")
+            if not name or name == "lo" or name.startswith("wl"):
+                continue
+            # Accept eth*, enp*, eno*, ens*, etc.
+            if not (name.startswith("e") or name.startswith("br") or name.startswith("bond")):
+                continue
+            state = link.get("operstate", "DOWN")
+            connected = (state == "UP")
+            out["ethernetInterfaces"].append({
+                "ifname": name, "state": state.lower(),
+                "connected": connected, "connectionName": name
+            })
+            if connected:
+                out["ethernetConnected"] = True
+                if not out.get("activeEthernetDetails") or not out["activeEthernetDetails"].get("ipv4"):
+                    details = ip_details(name)
+                    details["ifname"] = name
+                    details["connectionName"] = name
+                    out["activeEthernetDetails"] = details
+    except (json.JSONDecodeError, KeyError):
+        pass
+
+# ─── Commands ─────────────────────────────────────────────────────────
+
+def cmd_status():
+    """Full device status: wifi, ethernet, connection details."""
+    paths = discover()
+    out = {
+        "wifiAvailable": False, "wifiConnected": False,
+        "stationState": "unknown", "deviceName": "", "powered": False,
+        "connectedSSID": "", "stationPath": "", "devicePath": "",
+        "ethernetConnected": False, "ethernetInterfaces": [],
+        "activeWifiDetails": {}, "activeEthernetDetails": {}
+    }
+
+    if not paths or not paths["device"]:
+        _check_ethernet(out)
+        json.dump(out, sys.stdout)
+        return
+
+    out["wifiAvailable"] = True
+    out["devicePath"] = paths["device"]
+    out["stationPath"] = paths.get("station", "")
+    out["deviceName"] = busctl_get(paths["device"], "net.connman.iwd.Device", "Name") or ""
+    out["powered"] = busctl_get(paths["device"], "net.connman.iwd.Device", "Powered") or False
+
+    if paths["station"]:
+        state = busctl_get(paths["station"], "net.connman.iwd.Station", "State") or "unknown"
+        out["stationState"] = state
+        out["wifiConnected"] = (state == "connected")
+
+        if out["wifiConnected"]:
+            net_path = busctl_get(paths["station"], "net.connman.iwd.Station", "ConnectedNetwork")
+            if net_path:
+                out["connectedSSID"] = busctl_get(net_path, "net.connman.iwd.Network", "Name") or ""
+
+            iface = out["deviceName"] or "wlan0"
+            link = wifi_link_info(iface)
+            ipd = ip_details(iface)
+            out["activeWifiDetails"] = {
+                **ipd, **link,
+                "ifname": iface,
+                "connectionName": out["connectedSSID"]
+            }
+
+    _check_ethernet(out)
+    json.dump(out, sys.stdout)
+
+
+def cmd_scan():
+    """Trigger scan and return network list."""
+    paths = discover()
+    if not paths or not paths["station"]:
+        json.dump({"error": "no station", "networks": {}}, sys.stdout)
+        return
+
+    sp = paths["station"]
+
+    # Fire scan (async)
+    run(["busctl", "call", IWD, sp, "net.connman.iwd.Station", "Scan"], timeout=15)
+    time.sleep(1)
+
+    networks = _get_ordered_networks(sp)
+    json.dump({"networks": networks}, sys.stdout)
+
+
+def _get_ordered_networks(station_path):
+    """Fetch ordered networks, trying JSON then text fallback."""
+    networks = {}
+
+    # Attempt 1: busctl JSON
+    out, _, rc = run(["busctl", "--json=short", "call", IWD, station_path,
+                      "net.connman.iwd.Station", "GetOrderedNetworks"])
+    if rc == 0 and out:
+        try:
+            blob = json.loads(out)
+            data = blob.get("data", [])
+            # Unwrap: could be [[[path, sig], ...]] or [[path, sig], ...]
+            items = data
+            if items and isinstance(items, list):
+                if len(items) == 1 and isinstance(items[0], list) and items[0] and isinstance(items[0][0], list):
+                    items = items[0]
+                elif len(items) == 1 and isinstance(items[0], list) and items[0] and isinstance(items[0][0], str):
+                    items = [items[0]]  # single network
+                elif isinstance(items[0], list):
+                    pass  # already [[path, sig], ...]
+
+            for item in items:
+                if isinstance(item, list) and len(item) >= 2:
+                    net_path, signal_raw = str(item[0]), int(item[1])
+                    _add_network(networks, net_path, signal_raw)
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError, ValueError):
+            pass
+
+    # Attempt 2: text output fallback
+    if not networks:
+        out, _, rc = run(["busctl", "call", IWD, station_path,
+                          "net.connman.iwd.Station", "GetOrderedNetworks"])
+        if rc == 0 and out:
+            # Format: a(on) N "/path" signal "/path" signal ...
+            tokens = re.findall(r'"([^"]+)"|(-?\d+)', out)
+            pairs = []
+            i = 0
+            flat = []
+            for path_match, num_match in tokens:
+                flat.append(path_match if path_match else num_match)
+
+            # Skip type descriptor(s), find first path
+            i = 0
+            while i < len(flat) and not flat[i].startswith("/"):
+                i += 1
+            while i + 1 < len(flat):
+                try:
+                    _add_network(networks, flat[i], int(flat[i + 1]))
+                except (ValueError, IndexError):
+                    pass
+                i += 2
+
+    return networks
+
+
+def _add_network(networks, net_path, signal_raw):
+    """Fetch network properties and add to dict."""
+    name = busctl_get(net_path, "net.connman.iwd.Network", "Name")
+    if not name:
+        return
+    ntype = busctl_get(net_path, "net.connman.iwd.Network", "Type")
+    conn = busctl_get(net_path, "net.connman.iwd.Network", "Connected")
+    networks[name] = {
+        "ssid": name,
+        "security": iwd_sec(ntype),
+        "signal": dbm100_to_pct(signal_raw),
+        "connected": conn or False,
+        "path": net_path
+    }
+
+
+def cmd_profiles():
+    """List known/saved networks."""
+    profiles = {}
+
+    # From /var/lib/iwd
+    iwd_dir = "/var/lib/iwd"
+    if os.path.isdir(iwd_dir):
+        for f in os.listdir(iwd_dir):
+            for ext in (".psk", ".open", ".8021x", ".wep"):
+                if f.endswith(ext):
+                    profiles[f[:-len(ext)]] = True
+                    break
+
+    # From D-Bus KnownNetworks
+    paths = discover()
+    if paths:
+        for kp in paths.get("known", []):
+            name = busctl_get(kp, "net.connman.iwd.KnownNetwork", "Name")
+            if name:
+                profiles[name] = True
+
+    json.dump({"profiles": profiles}, sys.stdout)
+
+
+def cmd_connect(args):
+    """Connect to a wifi network."""
+    if not args:
+        json.dump({"success": False, "error": "ssid required"}, sys.stdout)
+        return
+
+    ssid = args[0]
+    password = ""
+    hidden = False
+
+    i = 1
+    while i < len(args):
+        if args[i] == "--password" and i + 1 < len(args):
+            password = args[i + 1]
+            i += 2
+        elif args[i] == "--hidden":
+            hidden = True
+            i += 1
+        else:
+            i += 1
+
+    paths = discover()
+    iface = "wlan0"
+    if paths and paths["device"]:
+        iface = busctl_get(paths["device"], "net.connman.iwd.Device", "Name") or "wlan0"
+
+    cmd = ["iwctl"]
+    if password:
+        cmd.extend(["--passphrase", password])
+
+    if hidden:
+        cmd.extend(["station", iface, "connect-hidden", ssid])
+    else:
+        cmd.extend(["station", iface, "connect", ssid])
+
+    _, err, rc = run(cmd, timeout=30)
+    json.dump({
+        "success": rc == 0,
+        "ssid": ssid,
+        "error": err if rc != 0 else ""
+    }, sys.stdout)
+
+
+def cmd_disconnect():
+    """Disconnect current wifi connection."""
+    paths = discover()
+    if not paths or not paths["station"]:
+        json.dump({"success": False, "error": "no station"}, sys.stdout)
+        return
+
+    _, err, rc = run(["busctl", "call", IWD, paths["station"],
+                      "net.connman.iwd.Station", "Disconnect"])
+    json.dump({"success": rc == 0, "error": err if rc != 0 else ""}, sys.stdout)
+
+
+def cmd_forget(args):
+    """Forget a known network."""
+    if not args:
+        json.dump({"success": False, "error": "ssid required"}, sys.stdout)
+        return
+
+    ssid = args[0]
+    paths = discover()
+
+    # Try D-Bus KnownNetwork.Forget
+    if paths:
+        for kp in paths.get("known", []):
+            name = busctl_get(kp, "net.connman.iwd.KnownNetwork", "Name")
+            if name == ssid:
+                _, _, rc = run(["busctl", "call", IWD, kp,
+                                "net.connman.iwd.KnownNetwork", "Forget"])
+                if rc == 0:
+                    json.dump({"success": True, "ssid": ssid}, sys.stdout)
+                    return
+
+    # Fallback: delete provisioning file
+    for ext in (".psk", ".open", ".8021x", ".wep"):
+        fp = f"/var/lib/iwd/{ssid}{ext}"
+        if os.path.exists(fp):
+            try:
+                os.remove(fp)
+                json.dump({"success": True, "ssid": ssid}, sys.stdout)
+                return
+            except OSError as e:
+                json.dump({"success": False, "ssid": ssid, "error": str(e)}, sys.stdout)
+                return
+
+    json.dump({"success": False, "ssid": ssid, "error": "not found"}, sys.stdout)
+
+
+def cmd_connectivity():
+    """Check internet connectivity. Prints: full, limited, or none."""
+    _, _, rc = run(
+        ["curl", "-s", "-o", "/dev/null", "-w", "",
+         "--max-time", "5", "http://connectivitycheck.gstatic.com/generate_204"],
+        timeout=8
+    )
+    if rc == 0:
+        print("full")
+    else:
+        out, _, _ = run(["ip", "route", "show", "default"])
+        print("limited" if out else "none")
+
+
+def cmd_set_powered(args):
+    """Enable/disable wifi device."""
+    if not args or args[0] not in ("true", "false"):
+        json.dump({"error": "usage: set-powered true|false"}, sys.stdout)
+        return
+
+    paths = discover()
+    if not paths or not paths["device"]:
+        json.dump({"success": False, "error": "no device"}, sys.stdout)
+        return
+
+    _, err, rc = run(["busctl", "set-property", IWD, paths["device"],
+                      "net.connman.iwd.Device", "Powered", "b", args[0]])
+    json.dump({"success": rc == 0, "error": err if rc != 0 else ""}, sys.stdout)
+
+
+# ─── Main ─────────────────────────────────────────────────────────────
+
+COMMANDS = {
+    "status": lambda: cmd_status(),
+    "scan": lambda: cmd_scan(),
+    "profiles": lambda: cmd_profiles(),
+    "connect": lambda: cmd_connect(sys.argv[2:]),
+    "disconnect": lambda: cmd_disconnect(),
+    "forget": lambda: cmd_forget(sys.argv[2:]),
+    "connectivity": lambda: cmd_connectivity(),
+    "set-powered": lambda: cmd_set_powered(sys.argv[2:]),
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        json.dump({"error": f"usage: iwd-helper <{'|'.join(COMMANDS)}>",
+                    "commands": list(COMMANDS.keys())}, sys.stdout)
+        sys.exit(1)
+
+    try:
+        COMMANDS[sys.argv[1]]()
+    except BrokenPipeError:
+        pass
+    except Exception as e:
+        json.dump({"error": str(e)}, sys.stdout, default=str)
+        sys.exit(1)
