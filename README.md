@@ -8,6 +8,8 @@ Everything works: wifi toggle, network scanning, connect/disconnect, forget, sig
 
 NetworkManager is bloated, slow, and wraps wpa_supplicant which is also bloated and slow. iwd replaces both with a single daemon that connects faster and uses less memory. If you've already ditched NetworkManager, Noctalia's network widgets break because they shell out to `nmcli`. This fixes that.
 
+I got slightly annoyed when trying to set up iwd to work within noctalia so this is a really straightforward implement. Clone repo, run install.sh and it works instatly. run uninstall.sh and it replaces the NetworkManager linkage. 
+
 ## Requirements
 
 - [Noctalia Shell](https://github.com/noctalia-dev/noctalia-shell) v4.x
@@ -30,7 +32,7 @@ The installer:
 2. Backs up the original `NetworkService.qml` to `NetworkService.qml.nmcli.bak`
 3. Replaces it with the iwd version
 
-Restart Noctalia after installing.
+Noctalia should pick up the changes instantly, worst case scenario restart. 
 
 ## Uninstall
 
@@ -107,6 +109,9 @@ iwd-helper set-powered false
 - **Signal/rate/band**: Requires `iw` package. Without it, these fields are empty (cosmetic only).
 - **Connectivity check**: Uses `curl` to hit Google's connectivity endpoint. Without `curl`, reports "unknown".
 - **Noctalia v5**: This targets v4 only. v5 is a full C++ rewrite with its own networking stack.
+
+## Notes
+- **V5 Rewrite**: If you like this repo let me know what tweaks you'd wanna see in Noctalia, clean C++ is a great direction for noctalia. When it drop's i will make a similar mini project to fit into it. Changing ~30 lines of QML was harder for me than custom NPU tiling layouts. 
 
 ## License
 
