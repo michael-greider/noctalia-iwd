@@ -6,7 +6,9 @@ Everything works: wifi toggle, network scanning, connect/disconnect, forget, sig
 
 ## Why
 
-NetworkManager is bloated, slow, and wraps wpa_supplicant which is also bloated and slow. iwd replaces both with a single daemon that connects faster and uses less memory. If you've already ditched NetworkManager, Noctalia's network widgets break because they shell out to `nmcli`. This fixes that.
+NetworkManager is bloated, slow, and wraps wpa_supplicant which is also bloated and slow. iwd replaces both with a single daemon that connects faster and uses less memory. If you've already ditched NetworkManager, Noctalia's network widgets break because they shell out to `nmcli`. This fixes that. 
+
+This is no shade to noctalia shell but MAJOR shade to NetworkManager, it makes me sick to my stomach it is so bad
 
 I got slightly annoyed when trying to set up iwd to work within noctalia so this is a really straightforward implement. Clone repo, run install.sh and it works instatly. run uninstall.sh and it replaces the NetworkManager linkage. 
 
